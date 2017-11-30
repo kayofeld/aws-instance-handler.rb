@@ -6,18 +6,24 @@ class   InstanceHandler
 
   # Constructor
   def initialize(options)
-    @options = options
-    @key_name = options["key_name"]
-    @server_type = options["server_type"]
-    @region = options["region"]
-    @ec2 = Aws::EC2::Resource.new(region: options["region"])
-    @client = Aws::EC2::Client.new
-    @account_id = options["account_id"]
-    @image_id = options["ami_id"]
-    @script_path = options["script_to_execute"]
-    @batch_created = false
-    @nsg_created = false
-    @vpc_created = false
+    @ec2                = Aws::EC2::Resource.new(region: options["region"])
+    @client             = Aws::EC2::Client.new
+
+    @options            = options
+    
+    @account_id         = options["account_id"]
+    @image_id           = options["ami_id"]
+    @key_name           = options["key_name"]
+    @region             = options["region"]
+    @script_path        = options["script_to_execute"]
+    @server_type        = options["server_type"]
+    @vpc_cidr_block     = options["vpc_cidr_block"]
+
+    @batch_created      = false
+    @nsg_created        = false
+    @subnet_created     = false
+    @vpc_created        = false
+    @ip_associated      = false
   end # initialize
 
   
@@ -25,10 +31,22 @@ class   InstanceHandler
     if (@options["vpc"] == "new")
       self.create_vpc
     end
+    if (@options["gateway"] == "new")
+      self.create_gateway
+    end
+    if (@options["route"] == "new")
+      self.create_route
+    end
+    if (@options["subnet"] == "new")
+      self.create_subnet
+    end
     if (@options["nsg"] == "new")
       self.create_nsg
     end
     self.create_instance
+    if (@options["static_ip"] == "yes")
+      self.allocate_associate_ip
+    end
   end # CreateVM
   
   def destroy
@@ -36,12 +54,16 @@ class   InstanceHandler
     if (@batch_created)
       self.destroy_batch
     end
+    if (@ip_associated)
+      self.release_address
+    end
     if (@nsg_created)
       self.destroy_nsg
     end
     if (@vpc_created)
       self.destroy_vpc
     end
+    exit 1
   end # destroy
 
   ####################
@@ -53,7 +75,7 @@ class   InstanceHandler
       puts "creating vpc"
       @vpc = @ec2.create_vpc(
         {
-          cidr_block: "10.0.0.0/16"
+          cidr_block: "#{options["vpc_cidr_block"]}"
         }
       )
       
@@ -91,6 +113,32 @@ class   InstanceHandler
       exit 1
     end # VPC Creation
   end # create_vpc
+  
+  def allocate_associate_ip
+    puts "Allocating ip"
+    begin                      
+      @addr = @client.allocate_address(
+        {
+          domain: "vpc"
+        }
+      )
+      puts "Allocation id: #{@addr.allocation_id}"
+      puts "Associating ip with VM"
+      @client.associate_address(
+        {
+        allocation_id: @addr.allocation_id,
+        instance_id: @instance[0].id
+        }
+      )
+      @ip_associated = true
+      puts "SUCCESS: Address associated: associated address: #{@addr.public_ip}".green
+    rescue
+      puts "ERROR: could not allocate or associate address".red
+      self.destroy
+      exit 1
+    end  # ip allocation    
+  end # create_allocate_ip
+
 
   def create_nsg
     begin # fetch vpc id
@@ -231,9 +279,76 @@ class   InstanceHandler
    rescue
      puts "ERROR: Could not create NSG".red
      self.destroy
-     exit 1
    end # nsg creation
   end # create_nsg
+
+  def create_subnet
+    begin # subnet creation
+
+      puts "creating subnet"
+      @subnet = @ec2.create_subnet(
+        {
+          vpc_id: @vpc.id,
+          cidr_block: options["subnet_cidr_block"],
+          availability_zone: options["availability_zone"]
+        }
+      )
+      @subnet.create_tags(
+        {
+          tags:
+            [
+              {
+                key: 'Name',
+                value: "#{options["project_name"]}Subnet"
+              }
+            ]
+        }
+      )
+      puts "SUCCESS: Subnet created: subnet id: #{@subnet.id}".green
+      @subnet_created = true
+    rescue
+      puts "ERROR: could not create subnet".red
+      self.destroy
+    end # Subnet creation
+  end # create_subnet
+
+  def create_gateway
+    puts "Creating gateway"
+    begin # gateway creation
+      @igw = @client.create_internet_gateway()[:internet_gateway]
+      @client.attach_internet_gateway(
+        {
+          :internet_gateway_id => @igw[:internet_gateway_id],  
+          :vpc_id => @vpc.id
+        }
+      )
+      puts "SUCCESS: Gateway created".green
+    rescue
+      puts "ERROR: Failed to create gateway".red
+      self.destroy
+    end # gateway creation
+  end # create_gateway
+
+  def create_route
+    puts "Creating routing table"
+    begin
+      @route = @ec2.create_route_table({vpc_id: @vpc.id})
+      puts "SUCCESS: routing table initialized. id: #{@route.id}".green
+      puts "Creating route"
+      @client.create_route(
+        {
+          destination_cidr_block: "0.0.0.0/0",
+          gateway_id: @igw.internet_gateway_id,
+          route_table_id: @route.id,
+        }
+      )
+      puts "SUCCESS: route created".green
+    rescue
+      puts "ERROR: Failed to create route".red
+      self.destroy
+    end # route creation
+  end # create_route
+
   
   def create_instance
     begin # Instance creation
@@ -336,6 +451,31 @@ class   InstanceHandler
     end
   end # destroy_nsg
 
+  def destroy_subnet
+    puts "Deleting subnet"
+    begin
+      @subnet.delete
+      puts "SUCCESS: subnet deleted".green
+    rescue
+      puts "ERROR: Problem deleting subnet #{@subnet.id}".red
+    end
+  end # destroy_subnet
+
+  def release_address
+    puts "Releasing allocated IP address"
+    begin
+      @client.release_address(
+        {
+          allocation_id: @addr.allocation_id
+        }
+      )
+      puts "SUCCESS: Address successfully released".green
+    rescue
+      puts "ERROR: Could not release address".red
+    end
+  end # release_address
+
+  
   def destroy_vpc
     puts "Deleting VPC"
     begin
@@ -345,4 +485,32 @@ class   InstanceHandler
       puts "ERROR: Problem deleting vpc #{@vpc.id}".red
     end
   end # destroy_vpc
+
+  def destroy_gateway
+    begin
+      @ec2.delete_internet_gateway(
+        {
+          internet_gateway_id: @igw.internet_gateway_id
+        }
+      )
+    rescue
+      puts "ERROR: Could not delete internet gateway".red
+    end
+    
+  end # destroy_gateway
+
+  def destroy_route
+    begin
+      puts "Deleting route table"
+      @ec2.delete_route_table(
+        {
+          route_table_id: route_table_id
+        }
+      )
+      puts "SUCCESS: route table deleted".green
+    rescue
+      puts "ERROR: Could not delete route table".red
+    end
+  end # destroy_route  
+  
 end #   Class InstanceHandler

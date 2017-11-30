@@ -54,12 +54,12 @@ fi
 # Deactivation of selinux
 deactivate_selinux
 
-# # Import of the CA (Frafos) certificate and Frafos Keys
+# # Import of the CA certificate and Keys
 inject_keys
 
 
 # # Updating sources
 yum_update
 
-# # Installing SBC
+# # Installing 
 install_dependencies
