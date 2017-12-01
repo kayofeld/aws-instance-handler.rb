@@ -39,18 +39,6 @@ function deactivate_selinux {
 ###                        Beginning of the execution                          ###
 ##################################################################################
 
-# Make shure root is running this script
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root" 1>&2
-    echo ""
-    read -p "Restart as root ? [y/N]" yn
-    case $yn in
-	[Yy]* ) sudo ./deploy-sbc.sh; exit 0;;
-	* ) ;;
-    esac
-    exit 1
-fi
-
 # Deactivation of selinux
 deactivate_selinux
 
